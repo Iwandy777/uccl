@@ -253,9 +253,18 @@ struct ibv_mr* RdmaContext::reg_mem_gpu_dmabuf(void* addr, size_t size) const {
   size_t offset_in_alloc = (uintptr_t)addr - (uintptr_t)alloc_base;
 
   // Export the entire allocation as a DMA-BUF fd (aligned to granularity).
+#if defined(__MUSA_PLATFORM_MT__)
+  // MUSA's driver rejects a DMA-BUF export whose size exceeds the actual
+  // allocation (muMemGetHandleForAddressRange returns NOT_SUPPORTED). The
+  // allocation size reported by the driver is already page-aligned, so export
+  // exactly that range instead of rounding up to kDmabufGranularity.
+  (void)kDmabufGranularity;
+  size_t export_size = alloc_size;
+#else
   size_t export_size =
       ((alloc_size + kDmabufGranularity - 1) / kDmabufGranularity) *
       kDmabufGranularity;
+#endif
 
   UCCL_LOG(INFO, UCCL_RDMA)
       << "DMA-BUF: gpu_buf=" << addr << " bytes=" << size << " alloc_base=0x"
@@ -391,11 +400,20 @@ RdmaContext::RegistrationMode RdmaContext::get_registration_mode(
     void* addr) const {
   bool is_gpu = is_gpu_pointer(addr);
   // Intel RDMA NICs use DMA-BUF for GPU memory registration.
+  // Moore Threads MUSA GPUs have no nvidia_peermem-style kernel module
+  // registered with the NIC driver, so direct ibv_reg_mr_iova2 of GPU BAR
+  // addresses faults (EFAULT) regardless of NIC vendor; always go through
+  // DMA-BUF (which MUSA supports — MU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED)
+  // for GPU memory on this platform.
+#if defined(__MUSA_PLATFORM_MT__)
+  bool use_dmabuf = is_gpu;
+#else
   bool use_dmabuf = (is_intel_vendor(vendor_id_) && is_gpu);
+#endif
   if (use_dmabuf) {
     UCCL_LOG(INFO, UCCL_RDMA)
-        << "GPU memory detected on irdma NIC (vendor=0x" << std::hex
-        << vendor_id_ << std::dec << "), using DMA-BUF registration";
+        << "GPU memory detected (vendor=0x" << std::hex << vendor_id_
+        << std::dec << "), using DMA-BUF registration";
   }
   return {is_gpu, use_dmabuf};
 }

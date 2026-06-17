@@ -6,7 +6,10 @@
 // These definitions must match the NCCL ABI. They are stable across
 // NCCL 2.x versions.
 
-#if defined(__HIP_PLATFORM_AMD__)
+#if defined(__MUSA_PLATFORM_MT__)
+#include <musa_runtime_api.h>
+typedef musaStream_t cudaStream_t;
+#elif defined(__HIP_PLATFORM_AMD__)
 #include <hip/hip_runtime_api.h>
 typedef hipStream_t cudaStream_t;
 #else

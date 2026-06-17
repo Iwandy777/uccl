@@ -1,6 +1,98 @@
 #pragma once
 
-#ifndef __HIP_PLATFORM_AMD__
+#if defined(__MUSA_PLATFORM_MT__)
+#include <musa.h>
+#include <musa_runtime.h>
+#define gpuSuccess musaSuccess
+#define gpuError_t musaError_t
+#define gpuGetErrorString musaGetErrorString
+#define gpuStream_t musaStream_t
+#define gpuStreamNonBlocking musaStreamNonBlocking
+#define gpuStreamLegacy musaStreamLegacy
+#define gpuStreamPerThread musaStreamPerThread
+#define gpuStreamCreate musaStreamCreate
+#define gpuStreamCreateWithFlags musaStreamCreateWithFlags
+#define gpuStreamSynchronize musaStreamSynchronize
+#define gpuStreamDestroy musaStreamDestroy
+#define gpuLaunchHostFunc musaLaunchHostFunc
+#define gpuHostFn_t musaHostFn_t
+#define gpuDeviceProp musaDeviceProp
+#define gpuSetDevice musaSetDevice
+#define gpuDeviceMapHost musaDeviceMapHost
+#define gpuSetDeviceFlags musaSetDeviceFlags
+#define gpuGetDevice musaGetDevice
+#define gpuGetDeviceCount musaGetDeviceCount
+#define gpuGetDeviceProperties musaGetDeviceProperties
+#define gpuDeviceGetPCIBusId musaDeviceGetPCIBusId
+#define gpuDeviceCanAccessPeer musaDeviceCanAccessPeer
+#define gpuDeviceEnablePeerAccess musaDeviceEnablePeerAccess
+#define gpuIpcMemHandle_t musaIpcMemHandle_t
+#define gpuIpcMemLazyEnablePeerAccess musaIpcMemLazyEnablePeerAccess
+#define gpuIpcOpenMemHandle musaIpcOpenMemHandle
+#define gpuIpcGetMemHandle musaIpcGetMemHandle
+#define gpuIpcCloseMemHandle musaIpcCloseMemHandle
+#define gpuHostMalloc musaMallocHost  // no musaHostMalloc API in MUSA
+#define gpuHostAlloc musaHostAlloc
+#define gpuHostFree musaFreeHost
+#define gpuHostAllocMapped musaHostAllocMapped
+#define gpuMalloc musaMalloc
+#define gpuMallocAsync musaMallocAsync
+#define gpuMallocHost musaMallocHost
+#define gpuFree musaFree
+#define gpuFreeAsync musaFreeAsync
+#define gpuFreeHost musaFreeHost
+#define gpuMemcpyHostToDevice musaMemcpyHostToDevice
+#define gpuMemcpyDeviceToHost musaMemcpyDeviceToHost
+#define gpuMemcpy musaMemcpy
+#define gpuMemcpyAsync musaMemcpyAsync
+#define gpuMemcpyPeerAsync musaMemcpyPeerAsync
+#define gpuMemcpyDeviceToDevice musaMemcpyDeviceToDevice
+#define gpuMemcpyFromSymbol musaMemcpyFromSymbol
+#define gpuMemsetAsync musaMemsetAsync
+#define gpuGetLastError musaGetLastError
+#define gpuErrorPeerAccessAlreadyEnabled musaErrorPeerAccessAlreadyEnabled
+#define gpuErrorNotReady musaErrorNotReady
+#define gpuEvent_t musaEvent_t
+#define gpuEventCreate musaEventCreate
+#define gpuEventDestroy musaEventDestroy
+#define gpuEventRecord musaEventRecord
+#define gpuEventQuery musaEventQuery
+#define gpuEventSynchronize musaEventSynchronize
+#define gpuStreamWaitEvent musaStreamWaitEvent
+#define gpuEventCreateWithFlags musaEventCreateWithFlags
+#define gpuEventDefault musaEventDefault
+#define gpuEventDisableTiming musaEventDisableTiming
+#define gpuEventInterprocess musaEventInterprocess
+#define gpuIpcEventHandle_t musaIpcEventHandle_t
+#define gpuIpcGetEventHandle musaIpcGetEventHandle
+#define gpuIpcOpenEventHandle musaIpcOpenEventHandle
+// musaIpcCloseEventHandle is not exposed by the MUSA runtime (same situation
+// as HIP); the MUSA runtime reclaims interprocess event handles internally.
+#define gpuIpcCloseEventHandle(handle) (gpuSuccess)
+// DMA-BUF / GPU driver types for GPUDirect RDMA
+#define gpuDriverResult_t MUresult
+#define gpuDevicePtr_t MUdeviceptr
+#define gpuDriverSuccess MUSA_SUCCESS
+#define gpuMemRangeHandleType MUmemRangeHandleType
+#define GPU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD MU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD
+#define gpuPointerAttribute_t musaPointerAttributes
+#define gpuPointerGetAttributes musaPointerGetAttributes
+#define gpuMemoryTypeDevice musaMemoryTypeDevice
+#define GPU_DRIVER_LIB_NAME "libmusa.so.1"
+#define GPU_DRIVER_LIB_NAME_FALLBACK "libmusa.so"
+#define GPU_DRIVER_GET_HANDLE_FOR_ADDRESS_RANGE_NAME \
+  "muMemGetHandleForAddressRange"
+inline gpuError_t gpuMemGetAddressRange(void** base_ptr, size_t* size,
+                                        void* ptr) {
+  MUdeviceptr base;
+  MUresult result = muMemGetAddressRange(&base, size, (MUdeviceptr)ptr);
+  if (result == MUSA_SUCCESS) {
+    *base_ptr = (void*)base;
+    return gpuSuccess;
+  }
+  return gpuError_t(result);
+}
+#elif !defined(__HIP_PLATFORM_AMD__)
 #include <cuda.h>
 #include <cuda_runtime.h>
 #define gpuSuccess cudaSuccess

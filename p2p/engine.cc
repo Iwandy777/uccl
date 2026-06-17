@@ -220,6 +220,27 @@ Endpoint::Endpoint(uint32_t const gpu_idx) : passive_accept_(false) {
       GPU_RT_CHECK(
           gpuStreamCreateWithFlags(&ipc_streams_[i][j], gpuStreamNonBlocking));
     }
+#if defined(__MUSA_PLATFORM_MT__)
+    // Unlike CUDA, the MUSA runtime does not appear to honor
+    // gpuIpcMemLazyEnablePeerAccess when opening an IPC handle — a peer
+    // gpuMemcpyAsync against a freshly-opened handle fails with "invalid
+    // argument" unless peer access was already explicitly enabled. Proactively
+    // build the full peer-access mesh once at Endpoint construction time
+    // instead of relying on the lazy-enable flag used at each IPC open site.
+    for (int j = 0; j < ngpus; ++j) {
+      if (i == j) continue;
+      int can_access = 0;
+      if (gpuDeviceCanAccessPeer(&can_access, i, j) == gpuSuccess &&
+          can_access) {
+        gpuError_t err = gpuDeviceEnablePeerAccess(j, 0);
+        if (err != gpuSuccess && err != gpuErrorPeerAccessAlreadyEnabled) {
+          UCCL_LOG(WARN)
+              << "gpuDeviceEnablePeerAccess(" << i << "->" << j
+              << ") failed: " << gpuGetErrorString(err);
+        }
+      }
+    }
+#endif
   }
   GPU_RT_CHECK(gpuSetDevice(local_gpu_idx_));
 
@@ -1342,9 +1363,16 @@ bool Endpoint::write_ipc(uint64_t conn_id, void const* data, size_t size,
   auto dev_reset =
       uccl::finally([&]() { GPU_RT_CHECK(gpuSetDevice(orig_device)); });
 
-  // Open the remote IPC memory handle
+  // Open the remote IPC memory handle.
+  // On MUSA, open from the owner GPU's context so the returned pointer is a
+  // valid device pointer for that GPU (required for gpuMemcpyPeerAsync).
+#if defined(__MUSA_PLATFORM_MT__)
+  int ipc_dev = (!is_host && info.gpu_idx >= 0) ? info.gpu_idx : local_gpu_idx_;
+#else
+  int ipc_dev = local_gpu_idx_;
+#endif
   void* raw_dst_ptr = nullptr;
-  GPU_RT_CHECK(gpuSetDevice(local_gpu_idx_));
+  GPU_RT_CHECK(gpuSetDevice(ipc_dev));
   GPU_RT_CHECK(gpuIpcOpenMemHandle(&raw_dst_ptr, info.handle,
                                    gpuIpcMemLazyEnablePeerAccess));
 
@@ -1353,7 +1381,7 @@ bool Endpoint::write_ipc(uint64_t conn_id, void const* data, size_t size,
       reinterpret_cast<uintptr_t>(raw_dst_ptr) + info.offset);
 
   // Perform the memory copy using multiple streams for better performance
-  std::vector<gpuStream_t>& dst_streams = ipc_streams_[local_gpu_idx_];
+  std::vector<gpuStream_t>& dst_streams = ipc_streams_[ipc_dev];
   int num_streams =
       std::min(dst_streams.size(),
                size < kIpcSizePerEngine ? 1 : (size_t)size / kIpcSizePerEngine);
@@ -1367,8 +1395,18 @@ bool Endpoint::write_ipc(uint64_t conn_id, void const* data, size_t size,
         reinterpret_cast<uintptr_t>(dst_ptr) + i * chunk_size);
     auto copy_size = i == num_streams - 1 ? size - i * chunk_size : chunk_size;
 
+#if defined(__MUSA_PLATFORM_MT__)
+    if (!is_host && ipc_dev != local_gpu_idx_) {
+      GPU_RT_CHECK(gpuMemcpyPeerAsync(chunk_dst_ptr, ipc_dev, chunk_data,
+                                     local_gpu_idx_, copy_size, dst_streams[i]));
+    } else {
+      GPU_RT_CHECK(gpuMemcpyAsync(chunk_dst_ptr, chunk_data, copy_size,
+                                 memcpy_kind, dst_streams[i]));
+    }
+#else
     GPU_RT_CHECK(gpuMemcpyAsync(chunk_dst_ptr, chunk_data, copy_size,
                                 memcpy_kind, dst_streams[i]));
+#endif
   }
 
   // Wait for all streams to complete
@@ -1401,9 +1439,16 @@ bool Endpoint::read_ipc(uint64_t conn_id, void* data, size_t size,
   auto dev_reset =
       uccl::finally([&]() { GPU_RT_CHECK(gpuSetDevice(orig_device)); });
 
-  // Open the remote IPC memory handle
+  // Open the remote IPC memory handle.
+  // On MUSA, open from the owner GPU's context so the returned pointer is a
+  // valid device pointer for that GPU (required for gpuMemcpyPeerAsync).
+#if defined(__MUSA_PLATFORM_MT__)
+  int ipc_dev = (!is_host && info.gpu_idx >= 0) ? info.gpu_idx : local_gpu_idx_;
+#else
+  int ipc_dev = local_gpu_idx_;
+#endif
   void* raw_src_ptr = nullptr;
-  GPU_RT_CHECK(gpuSetDevice(local_gpu_idx_));
+  GPU_RT_CHECK(gpuSetDevice(ipc_dev));
   GPU_RT_CHECK(gpuIpcOpenMemHandle(&raw_src_ptr, info.handle,
                                    gpuIpcMemLazyEnablePeerAccess));
 
@@ -1412,7 +1457,7 @@ bool Endpoint::read_ipc(uint64_t conn_id, void* data, size_t size,
       reinterpret_cast<uintptr_t>(raw_src_ptr) + info.offset);
 
   // Perform the memory copy using multiple streams for better performance
-  std::vector<gpuStream_t>& src_streams = ipc_streams_[local_gpu_idx_];
+  std::vector<gpuStream_t>& src_streams = ipc_streams_[ipc_dev];
   int num_streams =
       std::min(src_streams.size(),
                size < kIpcSizePerEngine ? 1 : (size_t)size / kIpcSizePerEngine);
@@ -1426,8 +1471,18 @@ bool Endpoint::read_ipc(uint64_t conn_id, void* data, size_t size,
         reinterpret_cast<uintptr_t>(data) + i * chunk_size);
     auto copy_size = i == num_streams - 1 ? size - i * chunk_size : chunk_size;
 
+#if defined(__MUSA_PLATFORM_MT__)
+    if (!is_host && ipc_dev != local_gpu_idx_) {
+      GPU_RT_CHECK(gpuMemcpyPeerAsync(chunk_data, local_gpu_idx_, chunk_src_ptr,
+                                     ipc_dev, copy_size, src_streams[i]));
+    } else {
+      GPU_RT_CHECK(gpuMemcpyAsync(chunk_data, chunk_src_ptr, copy_size,
+                                 memcpy_kind, src_streams[i]));
+    }
+#else
     GPU_RT_CHECK(gpuMemcpyAsync(chunk_data, chunk_src_ptr, copy_size,
                                 memcpy_kind, src_streams[i]));
+#endif
   }
 
   // Wait for all streams to complete
@@ -1460,8 +1515,17 @@ bool Endpoint::writev_ipc(uint64_t conn_id, std::vector<void const*> data_v,
   auto dev_reset =
       uccl::finally([&]() { GPU_RT_CHECK(gpuSetDevice(orig_device)); });
 
-  GPU_RT_CHECK(gpuSetDevice(local_gpu_idx_));
-  std::vector<gpuStream_t>& streams = ipc_streams_[local_gpu_idx_];
+  // On MUSA, open IPC handles from the owner GPU's context so that
+  // gpuMemcpyPeerAsync receives valid device pointers.
+#if defined(__MUSA_PLATFORM_MT__)
+  bool first_is_dev = num_iovs > 0 && info_v[0].gpu_idx >= 0 &&
+      uccl::get_dev_idx(const_cast<void*>(data_v[0])) != -1;
+  int ipc_dev_w = first_is_dev ? info_v[0].gpu_idx : local_gpu_idx_;
+#else
+  int ipc_dev_w = local_gpu_idx_;
+#endif
+  GPU_RT_CHECK(gpuSetDevice(ipc_dev_w));
+  std::vector<gpuStream_t>& streams = ipc_streams_[ipc_dev_w];
 
   // Open all handles and issue all memcpys before syncing any stream.
   std::vector<void*> raw_ptrs(num_iovs, nullptr);
@@ -1488,8 +1552,18 @@ bool Endpoint::writev_ipc(uint64_t conn_id, std::vector<void const*> data_v,
       void* chunk_dst = reinterpret_cast<void*>(
           reinterpret_cast<uintptr_t>(dst_ptr) + i * chunk_size);
       auto copy_size = i == num_streams - 1 ? sz - i * chunk_size : chunk_size;
+#if defined(__MUSA_PLATFORM_MT__)
+      if (!is_host && ipc_dev_w != local_gpu_idx_) {
+        GPU_RT_CHECK(gpuMemcpyPeerAsync(chunk_dst, ipc_dev_w, chunk_src,
+                                       local_gpu_idx_, copy_size, streams[i]));
+      } else {
+        GPU_RT_CHECK(gpuMemcpyAsync(chunk_dst, chunk_src, copy_size,
+                                   memcpy_kind, streams[i]));
+      }
+#else
       GPU_RT_CHECK(gpuMemcpyAsync(chunk_dst, chunk_src, copy_size, memcpy_kind,
                                   streams[i]));
+#endif
     }
   }
 
@@ -1522,8 +1596,15 @@ bool Endpoint::readv_ipc(uint64_t conn_id, std::vector<void*> data_v,
   auto dev_reset =
       uccl::finally([&]() { GPU_RT_CHECK(gpuSetDevice(orig_device)); });
 
-  GPU_RT_CHECK(gpuSetDevice(local_gpu_idx_));
-  std::vector<gpuStream_t>& streams = ipc_streams_[local_gpu_idx_];
+#if defined(__MUSA_PLATFORM_MT__)
+  bool first_is_dev_r = num_iovs > 0 && info_v[0].gpu_idx >= 0 &&
+      uccl::get_dev_idx(data_v[0]) != -1;
+  int ipc_dev_r = first_is_dev_r ? info_v[0].gpu_idx : local_gpu_idx_;
+#else
+  int ipc_dev_r = local_gpu_idx_;
+#endif
+  GPU_RT_CHECK(gpuSetDevice(ipc_dev_r));
+  std::vector<gpuStream_t>& streams = ipc_streams_[ipc_dev_r];
 
   // Open all handles and issue all memcpys before syncing any stream.
   std::vector<void*> raw_ptrs(num_iovs, nullptr);
@@ -1550,8 +1631,18 @@ bool Endpoint::readv_ipc(uint64_t conn_id, std::vector<void*> data_v,
       void* chunk_dst = reinterpret_cast<void*>(
           reinterpret_cast<uintptr_t>(data_v[iov]) + i * chunk_size);
       auto copy_size = i == num_streams - 1 ? sz - i * chunk_size : chunk_size;
+#if defined(__MUSA_PLATFORM_MT__)
+      if (!is_host && ipc_dev_r != local_gpu_idx_) {
+        GPU_RT_CHECK(gpuMemcpyPeerAsync(chunk_dst, local_gpu_idx_, chunk_src,
+                                       ipc_dev_r, copy_size, streams[i]));
+      } else {
+        GPU_RT_CHECK(gpuMemcpyAsync(chunk_dst, chunk_src, copy_size,
+                                   memcpy_kind, streams[i]));
+      }
+#else
       GPU_RT_CHECK(gpuMemcpyAsync(chunk_dst, chunk_src, copy_size, memcpy_kind,
                                   streams[i]));
+#endif
     }
   }
 
@@ -1613,8 +1704,18 @@ bool Endpoint::write_ipc_async(uint64_t conn_id, void const* data, size_t size,
     void* chunk_dst = reinterpret_cast<void*>(
         reinterpret_cast<uintptr_t>(dst_ptr) + i * chunk_size);
     auto copy_size = i == num_streams - 1 ? size - i * chunk_size : chunk_size;
+#if defined(__MUSA_PLATFORM_MT__)
+    if (!is_host && target_gpu != local_gpu_idx_) {
+      GPU_RT_CHECK(gpuMemcpyPeerAsync(chunk_dst, target_gpu, chunk_data,
+                                     local_gpu_idx_, copy_size, streams[i]));
+    } else {
+      GPU_RT_CHECK(gpuMemcpyAsync(chunk_dst, chunk_data, copy_size, memcpy_kind,
+                                 streams[i]));
+    }
+#else
     GPU_RT_CHECK(gpuMemcpyAsync(chunk_dst, chunk_data, copy_size, memcpy_kind,
                                 streams[i]));
+#endif
     GPU_RT_CHECK(
         gpuEventCreateWithFlags(&op->events[i], gpuEventDisableTiming));
     GPU_RT_CHECK(gpuEventRecord(op->events[i], streams[i]));
@@ -1677,8 +1778,18 @@ bool Endpoint::read_ipc_async(uint64_t conn_id, void* data, size_t size,
     void* chunk_data = reinterpret_cast<void*>(
         reinterpret_cast<uintptr_t>(data) + i * chunk_size);
     auto copy_size = i == num_streams - 1 ? size - i * chunk_size : chunk_size;
+#if defined(__MUSA_PLATFORM_MT__)
+    if (!is_host && target_gpu != local_gpu_idx_) {
+      GPU_RT_CHECK(gpuMemcpyPeerAsync(chunk_data, local_gpu_idx_, chunk_src,
+                                     target_gpu, copy_size, streams[i]));
+    } else {
+      GPU_RT_CHECK(gpuMemcpyAsync(chunk_data, chunk_src, copy_size, memcpy_kind,
+                                 streams[i]));
+    }
+#else
     GPU_RT_CHECK(gpuMemcpyAsync(chunk_data, chunk_src, copy_size, memcpy_kind,
                                 streams[i]));
+#endif
     GPU_RT_CHECK(
         gpuEventCreateWithFlags(&op->events[i], gpuEventDisableTiming));
     GPU_RT_CHECK(gpuEventRecord(op->events[i], streams[i]));
@@ -1756,8 +1867,18 @@ bool Endpoint::writev_ipc_async(uint64_t conn_id,
       void* chunk_dst = reinterpret_cast<void*>(
           reinterpret_cast<uintptr_t>(dst_ptr) + i * chunk_size);
       auto copy_size = i == num_streams - 1 ? sz - i * chunk_size : chunk_size;
+#if defined(__MUSA_PLATFORM_MT__)
+      if (!is_host && target_gpu != local_gpu_idx_) {
+        GPU_RT_CHECK(gpuMemcpyPeerAsync(chunk_dst, target_gpu, chunk_src,
+                                       local_gpu_idx_, copy_size, streams[i]));
+      } else {
+        GPU_RT_CHECK(gpuMemcpyAsync(chunk_dst, chunk_src, copy_size,
+                                   memcpy_kind, streams[i]));
+      }
+#else
       GPU_RT_CHECK(gpuMemcpyAsync(chunk_dst, chunk_src, copy_size, memcpy_kind,
                                   streams[i]));
+#endif
       gpuEvent_t ev;
       GPU_RT_CHECK(gpuEventCreateWithFlags(&ev, gpuEventDisableTiming));
       GPU_RT_CHECK(gpuEventRecord(ev, streams[i]));
@@ -1836,8 +1957,18 @@ bool Endpoint::readv_ipc_async(uint64_t conn_id, std::vector<void*> data_v,
       void* chunk_dst = reinterpret_cast<void*>(
           reinterpret_cast<uintptr_t>(data_v[iov]) + i * chunk_size);
       auto copy_size = i == num_streams - 1 ? sz - i * chunk_size : chunk_size;
+#if defined(__MUSA_PLATFORM_MT__)
+      if (!is_host && target_gpu != local_gpu_idx_) {
+        GPU_RT_CHECK(gpuMemcpyPeerAsync(chunk_dst, local_gpu_idx_, chunk_src,
+                                       target_gpu, copy_size, streams[i]));
+      } else {
+        GPU_RT_CHECK(gpuMemcpyAsync(chunk_dst, chunk_src, copy_size,
+                                   memcpy_kind, streams[i]));
+      }
+#else
       GPU_RT_CHECK(gpuMemcpyAsync(chunk_dst, chunk_src, copy_size, memcpy_kind,
                                   streams[i]));
+#endif
       gpuEvent_t ev;
       GPU_RT_CHECK(gpuEventCreateWithFlags(&ev, gpuEventDisableTiming));
       GPU_RT_CHECK(gpuEventRecord(ev, streams[i]));
@@ -1873,9 +2004,30 @@ bool Endpoint::advertise_ipc(uint64_t conn_id, void* addr, size_t len,
   transfer_info.size = len;
   transfer_info.operation = 1;  // response
 
-  // Calculate aligned address and offset
-  auto addr_aligned = reinterpret_cast<uintptr_t>(addr) & ~(kIpcAlignment - 1);
-  auto addr_offset = reinterpret_cast<uintptr_t>(addr) - addr_aligned;
+  // Calculate aligned address and offset.
+  uintptr_t addr_aligned;
+  uintptr_t addr_offset;
+#if defined(__MUSA_PLATFORM_MT__)
+  // Record owner GPU so the receiver can pick the right device for peer copy.
+  // Gated to MUSA so the CUDA/HIP IPC paths keep their original behavior
+  // (they leave gpu_idx at its default -1).
+  transfer_info.gpu_idx = local_gpu_idx_;
+  // On MUSA, rounding down to a fixed alignment is unsafe: distinct musaMalloc
+  // allocations can be densely packed below the 1 MB boundary, so the rounded
+  // base may point into a *different* allocation, yielding an IPC handle for
+  // the wrong buffer. Query the true allocation base from the driver instead.
+  void* alloc_base = nullptr;
+  size_t alloc_size = 0;
+  if (gpuMemGetAddressRange(&alloc_base, &alloc_size, addr) == gpuSuccess) {
+    addr_aligned = reinterpret_cast<uintptr_t>(alloc_base);
+  } else {
+    addr_aligned = reinterpret_cast<uintptr_t>(addr) & ~(kIpcAlignment - 1);
+  }
+  addr_offset = reinterpret_cast<uintptr_t>(addr) - addr_aligned;
+#else
+  addr_aligned = reinterpret_cast<uintptr_t>(addr) & ~(kIpcAlignment - 1);
+  addr_offset = reinterpret_cast<uintptr_t>(addr) - addr_aligned;
+#endif
   transfer_info.offset = addr_offset;
 
   GPU_RT_CHECK(gpuIpcGetMemHandle(&transfer_info.handle,
@@ -1912,10 +2064,27 @@ bool Endpoint::advertisev_ipc(uint64_t conn_id, std::vector<void*> addr_v,
     transfer_info.size = len_v[i];
     transfer_info.operation = 1;  // response
 
-    // Calculate aligned address and offset
-    auto addr_aligned =
+    // Calculate aligned address and offset (see advertise_ipc for rationale).
+    uintptr_t addr_aligned;
+    uintptr_t addr_offset;
+#if defined(__MUSA_PLATFORM_MT__)
+    // Record owner GPU (MUSA-only; CUDA/HIP keep gpu_idx at default -1).
+    transfer_info.gpu_idx = local_gpu_idx_;
+    void* alloc_base = nullptr;
+    size_t alloc_size = 0;
+    if (gpuMemGetAddressRange(&alloc_base, &alloc_size, addr_v[i]) ==
+        gpuSuccess) {
+      addr_aligned = reinterpret_cast<uintptr_t>(alloc_base);
+    } else {
+      addr_aligned =
+          reinterpret_cast<uintptr_t>(addr_v[i]) & ~(kIpcAlignment - 1);
+    }
+    addr_offset = reinterpret_cast<uintptr_t>(addr_v[i]) - addr_aligned;
+#else
+    addr_aligned =
         reinterpret_cast<uintptr_t>(addr_v[i]) & ~(kIpcAlignment - 1);
-    auto addr_offset = reinterpret_cast<uintptr_t>(addr_v[i]) - addr_aligned;
+    addr_offset = reinterpret_cast<uintptr_t>(addr_v[i]) - addr_aligned;
+#endif
     transfer_info.offset = addr_offset;
 
     GPU_RT_CHECK(gpuIpcGetMemHandle(&transfer_info.handle,

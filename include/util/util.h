@@ -1182,7 +1182,17 @@ inline void checkMemoryLocation(void* ptr) {
 #endif
 
 inline int get_dev_idx(void* ptr) {
-#ifndef __HIP_PLATFORM_AMD__
+#if defined(__MUSA_PLATFORM_MT__)
+  musaPointerAttributes attributes;
+  musaError_t err = musaPointerGetAttributes(&attributes, ptr);
+  if (err == musaSuccess) {
+    if (attributes.type == musaMemoryTypeDevice) {
+      return attributes.device;
+    }
+    return -1;
+  }
+  return -1;
+#elif !defined(__HIP_PLATFORM_AMD__)
   cudaPointerAttributes attributes;
   cudaError_t err = cudaPointerGetAttributes(&attributes, ptr);
   if (err == cudaSuccess) {
